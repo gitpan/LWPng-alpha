@@ -1,6 +1,6 @@
 package LWP::Conn::HTTP; # An HTTP Connection class
 
-# $Id: HTTP.pm,v 1.26 1998/04/06 18:35:31 aas Exp $
+# $Id: HTTP.pm,v 1.31 1998/04/07 12:57:58 aas Exp $
 
 # Copyright 1997-1998 Gisle Aas.
 #
@@ -9,10 +9,34 @@ package LWP::Conn::HTTP; # An HTTP Connection class
 
 # A hack that should work at least on Linux
 # XXX: When we require IO-1.18, then this hack can be removed.
+require IO::Handle;
 unless (defined &IO::EINPROGRESS) {
     $! = 115;
     die "No EINPROGRESS found ($!)" unless $! eq "Operation now in progress";
     *IO::EINPROGRESS = sub () { 115; };
+
+    # we also emulate $handle->blocking call provided by newer versions of
+    # the IO modules
+    require Fcntl;
+    my $O_NONBLOCK = Fcntl::O_NONBLOCK();
+    my $F_GETFL    = Fcntl::F_GETFL();
+    my $F_SETFL    = Fcntl::F_SETFL();
+    *IO::Handle::blocking = sub {
+	my $fh = shift;
+	my $dummy = '';
+	my $old = fcntl($fh, $F_GETFL, $dummy);
+	return undef unless defined $old;
+	if (@_) {
+	    my $new = $old;
+	    if ($_[0]) {
+		$new &= ~$O_NONBLOCK;
+	    } else {
+		$new |= $O_NONBLOCK;
+	    }
+	    fcntl($fh, $F_SETFL, $new);
+	}
+	($old & $O_NONBLOCK) == 0;
+    }
 }
 
 use strict;
@@ -83,7 +107,7 @@ sub new
 	    next;
 	}
 
-	eval { $sock->blocking(0) };  # require IO-1.18 or better
+	$sock->blocking(0);
 	mainloop->timeout($sock, $timeout);
 
         *$sock->{'lwp_mgr'}             = $mgr;
@@ -105,6 +129,7 @@ sub new
 		# XXX Perhaps we need some way of checking the other
 		# addresses in @addrs if this one fail.
 		$sock->state("Connecting");
+		*$sock->{'lwp_rbuf'} = "";
 		mainloop->writable($sock);
 		return $sock;
 	    } else {
@@ -153,15 +178,21 @@ sub new_request
 	my $uri = $req->proxy ? $req->url->as_string : $req->url->full_path;
 	my $proto = $req->protocol || "HTTP/1.1";
 	push(@rlines, "$method $uri $proto");
-	$req->header("Host" => $req->url->netloc);
+	$req->header("Host" => $req->url->netloc);  # always override
+
 	my @conn_header;
 	*$self->{'lwp_req_count'}++;
 	if ($proto eq "HTTP/1.0") {
 	    # can't send any more request, server will close connection
 	    *$self->{'lwp_req_limit'} = 1;
 	} else {
+	    if (my $conn = $req->header("Connection")) {
+		if (grep lc($_) eq "close", split(/\s*,\s*/, $conn)) {
+		    *$self->{'lwp_req_limit'} = 1;
+		}
+	    }
 	    push(@conn_header, "close")
-		if *$self->{'lwp_req_count'} == *$self->{'lwp_req_limit'};
+		if *$self->{'lwp_req_count'} >= *$self->{'lwp_req_limit'};
 	    if (@TE) {
 		push(@conn_header, "TE");
 		$req->header(TE => join(",", @TE));
@@ -305,11 +336,11 @@ sub _error
     my $mgr = delete *$self->{'lwp_mgr'};
     my $req = *$self->{'lwp_req'};
     if ($req && @$req) {
-	my $cur_req = shift @$req;  # currect request never retried
+	my $cur_req = shift @$req;
 	$mgr->pushback_request($self, @$req) if @$req;
-	$mgr->connection_closed($self);
 	my $res = *$self->{'lwp_res'};
 	if ($res) {
+	    $mgr->connection_closed($self);
 	    # partial result already available
 	    $res->header("Client-Orig-Status" => $res->status_line);
 	    $res->code(591); # XXX
@@ -318,7 +349,18 @@ sub _error
 	    # return immediately.
 	    $cur_req->response_done($res);
 	} else {
-	    $cur_req->gen_response(590, "No response", $msg);
+	    my $count = *$self->{'lwp_req_count'} - @$req;
+	    if ($msg eq "EOF" && $count > 1) {
+		# The server closed the connection before sending any
+		# response to this request even if it had send response
+		# to some previous request.  This means that this request
+		# should be retried.
+		$mgr->pushback_request($self, $cur_req);
+		$mgr->connection_closed($self);
+	    } else {
+		$mgr->connection_closed($self);
+		$cur_req->gen_response(590, "No response", $msg);
+	    }
 	}
     } else {
 	$mgr->connection_closed($self);
@@ -414,6 +456,12 @@ use base qw(LWP::Conn::HTTP);
 
 use LWP::MainLoop qw(mainloop);
 require HTTP::Response;
+
+sub activate
+{
+    my $self = shift;
+    $self->new_request;  # try to pipeline another request
+}
 
 
 sub readable
@@ -522,12 +570,24 @@ sub check_rbuf
     return unless $self->response_data($req, "", $res);
     #print $res->as_string if $LWP::Conn::HTTP::DEBUG;
 
-    if ($code >= 400 && $code <= 599 &&  # we got an error and
+    if ($code >= 400 && $code <= 599 &&  # we got an error response and
 	*$self->{'lwp_wdyn'} &&          # we are still sending dynamic content
-	@{ *$self->{'lwp_req'} } == 1    # for request with error response
+	@{ *$self->{'lwp_req'} } == 1    # for request with this error response
        ) {
 	# make sure it gets terminated on next opportunity.
 	*$self->{'lwp_wdyn'} = sub { "" };
+    }
+
+    if (my $conn = $res->header("Connection")) {
+	if (grep lc($_) eq "close", split(/\s*,\s*/, $conn)) {
+	    # The server intends to close this connection once this response
+	    # is done.  No requests in the pipeline will work.
+	    my $req = *$self->{'lwp_req'};
+	    if (@$req > 1) {
+		*$self->{'lwp_mgr'}->pushback_request($self, splice(@$req, 1));
+	    }
+	    *$self->{'lwp_req_limit'} = 1;  # no more requests on this conn
+	}
     }
 
     # Determine how to find the end of message
