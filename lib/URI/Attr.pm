@@ -1,6 +1,6 @@
 package URI::Attr;
 
-# $Id: Attr.pm,v 1.2 1998/03/17 07:41:36 aas Exp $
+# $Id: Attr.pm,v 1.3 1998/04/01 09:04:04 aas Exp $
 
 # Copyright 1998 Gisle Aas.
 #
@@ -132,6 +132,28 @@ sub _make_hash
 {
     $_[0] = {} unless defined($_[0]);
     $_[0];
+}
+
+sub as_string
+{
+    my $self = shift;
+    my $level = shift || 0;
+    my($down, $attr) = @$self;
+    my $str = "";
+    if ($attr) {
+	$str = "(" . join(", ", sort keys %$attr) . ")\n";
+    } elsif ($level) {
+	$str .= "\n";
+    }
+    if ($down) {
+	for (sort keys %$down) {
+	    $str .= "$_";
+	    my $s = as_string($down->{$_}, $level+1);
+	    $s =~ s/^/  /gm;
+	    $str .= $s;
+	}
+    }
+    $str;
 }
 
 1;

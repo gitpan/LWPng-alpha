@@ -1,37 +1,54 @@
 #!/local/bin/perl 
 
-# This is a simple command line UA that can run several requests
-# in parallell.  The commands are:
-#
-#     get <url>      : spool request
-#     s              : stop all requests
-#     s <url>        : stop requests for this server
-#     p              : print state of UA
-#     c <url>        : set up connection to this host
-#     cp <key> <val> : set connection parameters
-#     q              : quit
-#
-#     de             : toggle event loop debugging
-#     dc             : toggle connection debugging
-#
+# This is a simple command line UA that can run several requests in
+# parallel.  You can control degree of pipelining and set debugging
+# flags too.
 
-
+use strict;
 use LWP::UA;
 $LWP::UA::DEBUG++;
-$ua = LWP::UA->new;
+my $ua = LWP::UA->new;
 
-$ua->conn_param(ReqLimit    => 3,
+$ua->conn_param(ReqLimit    => 10,
                 ReqPending  => 1,
 		Timeout     => 30,
 		IdleTimeout => 10);
 
 $ua->env_proxy;
 
-require LWP::Request;
+#require LWP::Authen::basic;
+#$ua->{'uattr'}->attr_update("DIR", "http://localhost/foo/")->{realm}="Foo";
+#$ua->{'uattr'}->attr_update("DIR", "http://localhost/")->{realm}="Bar";
+#$ua->{'uattr'}->attr_update("SERVER", "http://localhost/")->{realms}{"Foo"} = LWP::Authen::basic->new("gisle", "aas");
+#$ua->{'uattr'}->attr_update("SERVER", "http://localhost/")->{realms}{"Bar"} = LWP::Authen::basic->new("gisle", "aas2");
+#$ua->{'uattr'}->attr_update("SERVER", "http://localhost/")->{proxy_realms}{"Foo"} = LWP::Authen::basic->new("tor", "per");
+#$ua->{'uattr'}->attr_update("DOMAIN", "http://furu.g.aas.no/")->{proxy} = "http://localhost";
+$ua->{'uattr'}->attr_update("SCHEME", "http:")->{default_headers}{From} = 'libwww-perl@ics.uci.edu';
+
+
 require LWP::Conn::HTTP;
 
 use LWP::MainLoop qw(empty one_event readable);
 
+{
+    package MyRequest;
+    require LWP::Request;
+    use base 'LWP::Request';
+
+    sub login
+    {
+	my($self, $realm, $url, $proxy) = @_;
+	print "Please enter authentication info for $realm at $url\n";
+	my $uname =  main::prompt("Username: ");
+	return unless length $uname;
+	my $passwd = main::prompt("Passwd:   ");
+	return ($uname, $passwd);
+    }
+}
+
+
+$| = 1;
+print "ua> ";
 readable(\*STDIN, \&cmd);
 
 while (!empty) {
@@ -47,6 +64,9 @@ sub cmd
     eval {
 	if ($cmd eq "q") {
 	    exit;
+	} elsif ($cmd eq "Q") {
+	    my $ans = lc(prompt("really quit? "));
+	    exit if $ans eq "y" or $ans eq "yes";
 	} elsif ($cmd eq "p") {
 	    print $ua->as_string;
 	} elsif ($cmd eq "dc") {
@@ -67,14 +87,66 @@ sub cmd
 	    $ua->stop;
 	} elsif ($cmd =~ /^s\s+(\S+)/) {
 	    $ua->find_server($1)->stop;
-	} elsif ($cmd =~ /^(\w+)\s+(\S+)/i) {
-	    my $req = LWP::Request->new2(uc($1) => $2);
-	    #$req->{'auto_redirect'}++;
-	    #$req->{'auto_auth'}++;
-	    $ua->spool($req);
+	} elsif ($cmd =~ /^\s*(\d*)\s*(\w+)\s+(\S+)\s*$/) {
+	    my $count = $1 || 1;
+	    my $method = uc($2);
+	    my $url = $3;
+	    $ua->spool(map MyRequest->new2($method, $url), 1..$count);
+        } elsif ($cmd =~ /^\s*!\s*(.*)/) {
+	    my $ret = eval $1;
+	    if ($@) {
+		print $@;
+	    } else {
+		eval {
+		    require Data::Dumper;
+		    local $Data::Dumper::Terse;
+		    local $Data::Dumper::Indent;
+		    $Data::Dumper::Terse = 1;
+		    $Data::Dumper::Indent = 0;
+		    print Data::Dumper::Dumper($ret), "\n";
+		};
+		print $@ if $@;
+	    }
+        } elsif ($cmd eq "?" || $cmd eq "help") {
+            print <<EOT;
+<method> <url> : spool request
+s              : stop all requests
+s <url>        : stop requests for this server
+p              : print state of UA
+c <url>        : set up connection to this host
+cp <key> <val> : set connection parameters
+q              : quit
+
+de             : toggle event loop debugging
+dc             : toggle connection debugging
+!<perl-code>   : evaluate some perl code (and print result)
+EOT
+        } elsif ($cmd =~ /^\s*$/) {
+	    # ignore
 	} else {
-	    print "Unknown command '$cmd'\n";
+	    print "Unknown command '$cmd'.  The command '?' list known commands\n";
 	}
     };
     print STDERR $@ if $@;
+    print "ua> ";
+}
+
+
+sub prompt
+{
+    my $p = shift;
+    print $p;
+    my $buf;
+    my $done;
+    readable(\*STDIN,
+	     sub {
+		 my $n = sysread(STDIN, $buf, 512);
+		 chomp($buf);
+		 $done++;
+	     });
+    while (!empty && !$done) {
+	one_event;
+    }
+    readable(\*STDIN, \&cmd);
+    $buf;
 }

@@ -24,10 +24,12 @@ sub new
 	       servers => {},
 	      }, $class;
 
-    $ua->add_hook("request", \&setup_default_headers);
-    $ua->add_hook("request", \&setup_proxy);
-    #$ua->agent("libwww-perl/ng");
+    $ua->add_hook("spool_request", \&setup_default_headers);
+    $ua->add_hook("spool_request", \&setup_date);
+    $ua->add_hook("spool_request", \&setup_auth);
+    $ua->add_hook("spool_request", \&setup_proxy);
 
+    $ua->agent("libwww-perl/ng-alpha ($^O)");
     $ua;
 }
 
@@ -97,6 +99,8 @@ sub spool
     my $self = shift;
     my $spooled = 0;
     for my $req (@_) {
+	bless $req, "LWP::Request" if ref($req) eq "HTTP::Request"; #upgrade
+	$req->managed_by($self);
 	unless ($req->method) {
 	    $req->gen_response(400, "Missing METHOD in request");
 	    next;
@@ -110,13 +114,10 @@ sub spool
 	    $req->gen_response(400, "Request URL must be absolute");
 	    next;
 	}
-	bless $req, "LWP::Request" if ref($req) eq "HTTP::Request"; #upgrade
-
-	next unless $self->run_hooks_until_failure("request", $req);
+	next if $self->run_hooks_until_success("spool_request", $req);
 
 	my $proxy = $req->proxy;
 	my $server = $self->find_server($proxy ? $proxy : $req->url);
-	$req->managed_by($self);
 	$server->add_request($req);
 	$spooled++;
 	if ($DEBUG) {
@@ -175,9 +176,38 @@ sub setup_default_headers
 	    $req->header($k => $hash->{$k});
 	}
     }
-    1;
+    0; # continue
 }
 
+sub setup_date
+{
+    my($self, $req) = @_;
+    # Clients SHOULD only send a Date header field in messages that
+    # include an entity-body, as in the case of the PUT and POST
+    # requests, and even then it is optional.
+    $req->date(time) if length ${ $req->content_ref };
+    0;
+}
+
+
+sub setup_auth
+{
+    my($self, $req) = @_;
+    my $realm = $self->{'uattr'}->p_attr($req->url, "realm");
+    return unless $realm;
+    my $realms = $self->{'uattr'}->p_attr($req->url, "realms");
+    # should we ensure that this is a SERVER attribute?
+    unless ($realms) {
+	warn "No REALMS registered for this server";
+	return;
+    }
+    if (my $auth = $realms->{$realm}) {
+	$auth->set_authorization($req);
+    } else {
+	warn "Don't know about the '$realm' realm";
+    }
+    0;
+}
 
 sub cookie_jar
 {
@@ -185,9 +215,9 @@ sub cookie_jar
     my $old = $self->{'cookie_jar'};
     if (@_) {
 	if ($self->{'cookie_jar'} = shift) {
-	    $self->add_hook("request", \&setup_cookie) unless $old;
+	    $self->add_hook("spool_request", \&setup_cookie) unless $old;
 	} else {
-	    $self->remove_hook("request", \&setup_cookie);
+	    $self->remove_hook("spool_request", \&setup_cookie);
 	}
     }
     $old;
@@ -205,17 +235,37 @@ sub setup_cookie
 		       $jar->extract_cookies($res);
 		       1;
 		   });
-    1;
+    0;
 }
 
 
 sub setup_proxy
 {
     my($self, $req) = @_;
-    return 1 if $req->proxy;
-    my $proxy = $self->{'uattr'}->p_attr($req->url, "proxy");
-    $req->proxy($proxy);
-    1;
+    my $proxy = $req->proxy;
+    unless ($proxy) {
+	$proxy = $self->{'uattr'}->p_attr($req->url, "proxy");
+	return unless $proxy;
+	$req->proxy($proxy);
+    }
+
+    # Set up Proxy-Authorization perhaps
+    my $realms = $self->{'uattr'}->p_attr($proxy, "proxy_realms");
+    return unless $realms && %$realms;
+
+    if (keys %$realms > 1) {
+	# there is multiple realms to choose from.  Select the
+	# right one, if there is such a thing.
+	my $realm = $self->{'uattr'}->p_attr($req->url, "proxy_realm");
+	if (my $auth = $realms->{$realm}) {
+	    $auth->set_proxy_authorization($req);
+	}
+    } else {
+	# there is only one realm defined for this proxy server,
+	# so we might as well use it.
+	my($auth) = values %$realms;
+	$auth->set_proxy_authorization($req);
+    }
 }
 
 
@@ -272,10 +322,10 @@ sub as_string
 		push(@s, $s);
 	    }
 	    $str = join("", "\$servers = {\n", @s, "};\n");
-=com
 	} elsif ($_ eq "uattr") {
-	    $str = "\$uattr = ...\n";
-=cut
+	    my $s = $self->{uattr}->as_string;
+	    $s =~  s/^/    /mg; # indent
+	    $str = "\$uattr = {\n$s};\n";
 	} else {
 	    $str = Data::Dumper->Dump([$self->{$_}], [$_]);
 	}
