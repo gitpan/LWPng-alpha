@@ -57,21 +57,21 @@ sub cmd
 	    $LWP::EventLoop::DEBUG = !$LWP::EventLoop::DEBUG;
 	    print "Eventlopp debug is ",
 	          ($LWP::EventLoop::DEBUG ? "on" : "off"), "\n";
-	} elsif ($cmd =~ /^(get|head|trace)\s+(\S+)/i) {
-	    my $req = LWP::Request->new(uc($1) => $2);
-	    $req->{'auto_redirect'}++;
-	    $req->{'auto_auth'}++;
-	    $ua->spool($req);
 	} elsif ($cmd eq "sched") {
 	    $ua->reschedule;
 	} elsif ($cmd =~ /^c\s+(\S+)/) {
-	    $ua->server($1)->create_connection;
+	    $ua->find_server($1)->create_connection;
 	} elsif ($cmd =~ /^cp\s+(.*)/) {
 	    $ua->conn_param(split(' ', $1));
 	} elsif ($cmd eq "s") {
 	    $ua->stop;
 	} elsif ($cmd =~ /^s\s+(\S+)/) {
-	    $ua->server($1)->stop;
+	    $ua->find_server($1)->stop;
+	} elsif ($cmd =~ /^(\w+)\s+(\S+)/i) {
+	    my $req = LWP::Request->new(uc($1) => $2);
+	    #$req->{'auto_redirect'}++;
+	    #$req->{'auto_auth'}++;
+	    $ua->spool($req);
 	} else {
 	    print "Unknown command '$cmd'\n";
 	}
