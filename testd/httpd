@@ -1,0 +1,85 @@
+#!/usr/bin/perl -w
+
+use strict;
+my $URL_FILE = "URL";
+my $DEF_SIZE = 8*1024;
+
+use HTTP::Daemon;
+use Time::HiRes qw(sleep time);
+
+my $d = new HTTP::Daemon;
+$SIG{PIPE} = 'IGNORE';  # if syswrite() on the socket fails
+
+open(URL, ">$URL_FILE") || die "Can't open $URL_FILE: $!";
+print URL $d->url, "\n";
+close(URL);
+
+print "<URL:", $d->url, ">\n";
+
+my $req_no = 1;
+while (my $c = $d->accept) {
+    if (my $r = $c->get_request) {
+	print $req_no++, ": ";
+	print $r->as_string;
+	$c->autoflush;
+	my $u = $r->url;
+
+        my %q;
+	eval { %q = $u->query_form; };
+	my $wait = ($q{w} || 0) / 1000;
+	my $bsize = $q{cs} || $DEF_SIZE;
+	my $line = $q{line};
+	my $cr = $q{cr};
+	$line++ if $cr;
+
+	my $file = ($u->path_components)[1];
+	if ($file && !($file =~ m,/,)) {
+	    if (open(FILE, $file)) {
+                my $before = time;
+		print "[";
+		if ($line) {
+		    # we should output the file a line at time
+                    my $count = 0;
+		    while (<FILE>) {
+			if ($cr) {
+			    chomp;
+			    $cr = 0 unless length;  # headers done
+			    $_ .= "\015\012";
+			}
+                        print $c $_;
+                        $count++;
+			sleep($wait) if $wait;
+		    }
+		    print "$count lines response sent";
+		} else {
+                    my $bytes = 0;
+                    my $blocks = 0;
+                    my $buf;
+                    while (my $n = sysread(FILE, $buf, $bsize)) {
+                        $blocks++;
+			$n = syswrite($c, $buf, length($buf));
+			if (!defined($n)) {
+			    print "syswrite error for block $blocks: $!\n";
+			    last;
+                        }
+			$bytes += $n;
+			if ($n != length($buf)) {
+			    print "short write ($n)\n";
+			    last;
+                        }
+			sleep($wait) if $wait;
+                    }
+		    print "$blocks blocks, $bytes bytes response sent";
+		}
+		printf " in %.2fs]\n\n", time - $before;
+	    } else {
+		$c->send_error(404);
+	    }
+        } else {
+	    $c->send_error(400);
+	}
+    }
+    $c->close;
+    $c = undef;
+}
+ 
