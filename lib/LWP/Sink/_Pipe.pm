@@ -1,4 +1,4 @@
-package LWP::Sink::_trans;
+package LWP::Sink::_Pipe;
 
 use strict;
 
@@ -12,10 +12,10 @@ sub sink
     $old;
 }
 
-sub append
+sub push
 {
     my($self, $sink) = @_;
-    return $self->{'sink'}->append($sink) if $self->{'sink'};
+    return $self->{'sink'}->push($sink) if $self->{'sink'};
     $self->{'sink'} = $sink;
     $self;
 }

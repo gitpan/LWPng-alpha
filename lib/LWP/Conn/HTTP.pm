@@ -1,6 +1,6 @@
 package LWP::Conn::HTTP; # An HTTP Connection class
 
-# $Id: HTTP.pm,v 1.20 1998/03/26 15:06:59 aas Exp $
+# $Id: HTTP.pm,v 1.22 1998/03/30 10:29:06 aas Exp $
 
 # Copyright 1997-1998 Gisle Aas.
 #
@@ -164,7 +164,7 @@ sub new_request
 		if *$self->{'lwp_req_count'} == *$self->{'lwp_req_limit'};
 	    if (@TE) {
 		push(@conn_header, "TE");
-		$req->push_header(TE => join(", ", @TE));
+		$req->header(TE => join(", ", @TE));
 	    }
 	}
 	$req->header("Connection" => join(", ", @conn_header)) if @conn_header;
@@ -494,15 +494,15 @@ sub check_rbuf
 			die "No filter for TE '$enc': $@" if $@;
 		    }
 		    $filter = "$filter\::decode"->new(@$_);
-		    $te = $te ? $te->append($filter) : $filter;
-		    $te->append(LWP::Sink::Monitor->new($enc))
+		    $te = $te ? $te->push($filter) : $filter;
+		    $te->push(LWP::Sink::Monitor->new($enc))
 			if $LWP::Conn::HTTP::DEBUG;
 		}
 		if ($te) {
 		    # Just terminate the stream with a callback closure
 		    # that feeds the data to $req->response_data
-		    $te->append(LWP::Sink::identity->new);
-		    $te->append( sub { $req->response_data($_[0], $res); } );
+		    $te->push(LWP::Sink::identity->new);
+		    $te->push( sub { $req->response_data($_[0], $res); } );
 		    *$self->{'lwp_te'} = $te;
 		}
 	    };
