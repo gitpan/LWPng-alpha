@@ -1,6 +1,37 @@
+=begin todo
+
+Non-blocking connect (common base class for both HTTP and FTP)
+
+Base class like Net::Cmd make some of the response parsing code
+reusable for SMTP and NNTP.
+
+Access files relative to current directory after login.  This is how
+RFC 1738 says that ftp: URLs should be interpreted.  This is now how
+popular browsers do it.  They interpret the first "/" of the URL-path
+literally.  Option for enabling this behaviour??
+
+Is there a better way to implement HEAD???  Currently we do RETR and
+then send ABOR on the first 1xx reponse.  If only SIZE/MDTM did return
+a different response for not-found and directories :-(
+
+Set IdleTimeout when we go Idle.
+
+Use CWD to locate directory when server is not UNIX.  RFC1738 says
+that there is no general reliable way to get to another directory once
+this is done, i.e. one must disconnect after this.
+
+Implement ;type=a perhaps
+
+If file name ends with "/" assume that it is a directory and skip RETR
+(go for LIST right away.)
+
+=end todo
+
+=cut
+
 package LWP::Conn::FTP;
 
-# $Id: FTP.pm,v 1.4 1998/04/28 15:37:52 aas Exp $
+# $Id: FTP.pm,v 1.13 1998/04/29 13:39:39 aas Exp $
 
 # Copyright 1997-1998 Gisle Aas.
 #
@@ -10,6 +41,8 @@ package LWP::Conn::FTP;
 use IO::Socket ();
 use LWP::MainLoop qw(mainloop);
 use strict;
+
+require HTTP::Response;
 
 use vars qw($DEBUG @ISA);
 @ISA=qw(IO::Socket::INET);
@@ -27,15 +60,26 @@ sub new
     $port = $1 if $host =~ s/:(\d+)//;
     $port = delete $cnf{Port} || delete $cnf{PeerPort} || $port || 21;
 
+    # XXX Should really use non-blocking connect as done for HTTP
     my $sock = IO::Socket::INET->new(PeerAddr => $host,
 				     PeerPort => $port);
     return unless $sock;
+
+    {
+	# Interim solution to make it non-blocking...
+	require LWP::Conn::HTTP;
+	$sock->blocking(0);
+    }
+
     bless $sock, $class;
     
     *$sock->{'lwp_mgr'}  = $mgr;
     *$sock->{'lwp_type'} = "";
     *$sock->{'lwp_rbuf'} = "";
     *$sock->{'lwp_rlim'} = delete $cnf{ReqLimit} || 4;
+    my $timeout = delete $cnf{Timeout} || 5*60;
+    *$sock->{'lwp_timeout'} = $timeout;
+    *$sock->{'lwp_idletimeout'} = delete $cnf{IdleTimeout} || $timeout;
 
     if (%cnf && $^W) {
 	for (keys %cnf) {
@@ -45,14 +89,14 @@ sub new
 
     $sock->state("Start");
     mainloop->readable($sock);
-    mainloop->timeout($sock, 4);
+    mainloop->timeout($sock, $timeout);
     $sock;
 }
 
 sub state
 {
     my($self, $state) = @_;
-    print "STATE: $state\n" if $DEBUG;
+    print "STATE: $state\n" if $DEBUG && $DEBUG > 1;
     my $class = "LWP::Conn::FTP::$state";
     bless $self, $class;
 }
@@ -73,14 +117,17 @@ sub error
 sub _error
 {
     my($self, $msg) = @_;
-    $msg .= "\n" unless substr($msg,-1,1) eq "\n";
-    print STDERR "ERROR: $msg";
+    chomp($msg);
+    print STDERR "ERROR: $msg\n";
     mainloop->forget($self);
     $self->close;
     if (my $data = delete *$self->{'lwp_data'}) {
 	$data->close;
     }
     *$self->{'lwp_mgr'}->connection_closed($self);
+    if (my $req = delete *$self->{'lwp_req'}) {
+	$req->gen_response(590, $msg);
+    }
 }
 
 sub readable
@@ -132,14 +179,16 @@ sub parse_response
 	    return $self->reponse_error(join("\n", @res));
 	}
 	push(@res, $line);
+	last unless $more;
     }
     if ($more) {
 	unshift(@{*$self->{'lwp_lines'}}, @res);
     } elsif ($code) {
 	*$self->{'lwp_response_code'} = $code;
 	*$self->{'lwp_response_mess'} = \@res;
-	print STDERR "====>\t", join("\n\t", @res), "\n" if $DEBUG;
+	print STDERR "   <===\t", join("\n\t", @res), "\n" if $DEBUG;
 	$self->response(substr($code, 0, 1), $code);
+	$self->parse_response;
     }
 }
 
@@ -174,7 +223,7 @@ sub send_cmd
     if ($DEBUG) {
 	my $out = $cmd;
 	$out =~ s/^(PASS\s+)(.+)/$1 . "*" x length($2)/e;
-	print STDERR "$out\n";
+	print STDERR "===>\t$out\n";
     }
     $cmd .= "\015\012";
     # XXX should really wait for the socket to become writable, but
@@ -186,6 +235,12 @@ sub send_cmd
 
 sub activate
 {
+}
+
+sub stop
+{
+    my $self = shift;
+    $self->_error("STOP");
 }
 
 sub login_info
@@ -224,7 +279,7 @@ sub response
     $mess =~ s/^\d+\s+//;
     $mess =~ s/^[\w\.]+\s+//;  # host name
     $mess =~ s/\s+ready\.?\s+$//;
-    $mess =~ s/\s+\(Version\s+/\// && $mess =~ s/\)//;
+    $mess =~ s/\s+\(Version\s+/\// && $mess =~ s/\)$//;
     *$self->{'lwp_server_product'} = $mess;
     $self->send_cmd("SYST" => "Syst");
 }
@@ -243,21 +298,26 @@ sub response
 	*$self->{'lwp_unix'}++ if $mess =~ /\bUNIX\b/i;
 	*$self->{'lwp_server_product'} .= " ($mess)";
     }
-    $self->state("Ready");
+    *$self->{'lwp_idle'}++;
+    $self->state("Outlogged");
     $self->activate;
 }
 
 
-package LWP::Conn::FTP::Ready;
+package LWP::Conn::FTP::Outlogged;
 use base 'LWP::Conn::FTP';
 
 sub activate
 {
     my $self = shift;
     my $req = *$self->{'lwp_mgr'}->get_request;
-    unless ($req) {
+    if (!$req) {
+	*$self->{'lwp_idle'}++;
 	*$self->{'lwp_mgr'}->connection_idle($self);
 	return;
+    } elsif (*$self->{'lwp_idle'}) {
+	*$self->{'lwp_idle'} = 0;
+	*$self->{'lwp_mgr'}->connection_active($self);
     }
     *$self->{'lwp_req'} = $req;
     (*$self->{'lwp_user'}, *$self->{'lwp_pass'}, *$self->{'lwp_acct'})
@@ -285,7 +345,7 @@ sub response
 sub login_complete
 {
     my $self = shift;
-    $self->state("Inlogged");
+    $self->state("Ready");
     $self->activate;
 }
 
@@ -295,7 +355,7 @@ sub cant_login
     my $mess = $self->message;
     $mess =~ s/^\d+\s+//;
     chomp($mess);
-    $self->state("Ready");
+    $self->state("Outlogged");
     $self->gen_response(401, $mess,
 			{"WWW-Authenticate" => 'Basic realm="FTP"',
 			});
@@ -342,7 +402,7 @@ sub response
 	$self->send_cmd("USER " . *$self->{'lwp_user'} => "User");
     } else {
 	if (my $req = delete *$self->{'lwp_req'}) {
-	    *$self->{'lwp_mgr'}->pushback_request($req);
+	    *$self->{'lwp_mgr'}->pushback_request($self, $req);
 	}
 	$self->error("Can't reinitialize");
     }
@@ -356,7 +416,7 @@ sub response
 {
     my($self, $r) = @_;
     if ($r eq "2") {
-	$self->state("Inlogged");
+	$self->state("Ready");
 	$self->activate;
     } else {
 	$self->error("Can't set TYPE");
@@ -364,7 +424,7 @@ sub response
 }
 
 
-package LWP::Conn::FTP::Inlogged;
+package LWP::Conn::FTP::Ready;
 use base 'LWP::Conn::FTP';
 use LWP::MainLoop qw(mainloop);
 
@@ -385,9 +445,14 @@ sub activate
     my $req = *$self->{'lwp_req'};
     unless ($req) {
 	$req = *$self->{'lwp_mgr'}->get_request;
-	unless ($req) {
+	if (!$req) {
+	    *$self->{'lwp_idle'}++;
 	    *$self->{'lwp_mgr'}->connection_idle($self);
 	    return;
+	} 
+	elsif (*$self->{'lwp_idle'}) {
+	    *$self->{'lwp_idle'} = 0;
+	    *$self->{'lwp_mgr'}->connection_active($self);
 	}
 	*$self->{'lwp_req'} = $req;
 	my($user, $pass, $acct) = $self->login_info($req);
@@ -404,9 +469,12 @@ sub activate
     my $method = uc($req->method);
     my $file = $req->url->path;
     if ($method =~ /^(GET|HEAD|PUT)$/) {
+	# It would be nice to also support APPEND, PUT-UNIQUE
 	return unless $self->type("I");  # we always use binary transfer mode
 
-	*$self->{'lwp_file'} = $file;
+	$self->file_trans($method, $file);
+	return;
+
 	my @cwd = qw();
 	if (@cwd) {
 	    @{*$self->{'lwp_cwd'}} = @cwd;
@@ -424,7 +492,6 @@ sub activate
 	$self->gen_response(501, "RENAME not implemented yet");
 
     } elsif ($method eq "TRACE") {
-	require HTTP::Response;
 	my $req = delete *$self->{'lwp_req'};
 	my $res = HTTP::Response->new(200, "OK");
 	$res->date(time);
@@ -445,6 +512,39 @@ sub cwd_done
     # we could start by running SIZE, MDTM and such to get header
     # information and also to check if the file is there.
     my $self = shift;
+
+}
+
+sub file_trans
+{
+    my($self, $method, $file) = @_;
+    *$self->{'lwp_meth'} = $method;
+    *$self->{'lwp_file'} = $file;
+
+    my $res = HTTP::Response->new(200, "OK");
+    $res->date(time);
+    $res->server(*$self->{'lwp_server_product'});
+    # XXX we should guess content_type and such here
+    *$self->{'lwp_res'} = $res;
+
+    if ($method eq "PUT") {
+	$self->port("W");
+    } else {
+	unless (*$self->{'lwp_noSIZE'}) {
+	    $self->send_cmd("SIZE $file" => "Size");
+	    return;
+	}
+	unless (*$self->{'lwp_noMDTM'}) {
+	    $self->send_cmd("MDTM $file" => "Mdtm");
+	    return;
+	}
+	$self->port(0);
+    }
+}
+
+sub port
+{
+    my($self, $write) = @_;
     my $data = IO::Socket::INET->new(Listen => 1,
 				     LocalAddr => $self->sockhost,
                                     );
@@ -454,8 +554,10 @@ sub cwd_done
 	$port = ($port >> 8) . "," . ($port & 0xFF);
 	$port = join(",", split(/\./, $data->sockhost)) . ",$port";
 	$self->send_cmd("PORT $port" => "Port");
-	bless $data, "LWP::Conn::FTP::Data::Listen";  # whow!!
+	bless $data, "LWP::Conn::FTP::Data::Listen";  # 4 level name - whow!!
 	mainloop->readable($data);
+	*$data->{'lwp_write'} = *$self->{'lwp_req'}->content_ref if $write;
+	# A little circular reference makes life more interesting...
 	*$data->{'lwp_ftp'} = $self;
 	*$self->{'lwp_data'} = $data;
     } else {
@@ -463,23 +565,69 @@ sub cwd_done
     }
 }
 
-sub data
-{
-    my($self, $data) = @_;
-    print "DATA: $self $data\n";
-}
+use Socket qw(MSG_OOB);
 
-sub data_done
+sub abort
 {
     my $self = shift;
-    print "DATA DONE\n";
-    if (++*$self->{'lwp_done'} == 2) {
-	print "The second one...\n";
-	my $req = delete *$self->{'lwp_req'};
-	$req->gen_response(200);
-	$self->activate;
+    send($self, "\377\364", 0);        # TELNET: IAC, IP
+    send($self, "\377\362", MSG_OOB);  # TELNET: IAC, DM
+    $self->send_cmd("ABOR");
+    if (my $data = delete *$self->{'lwp_data'}) {
+	$data->close;
     }
 }
+
+package LWP::Conn::FTP::Size;
+use base 'LWP::Conn::FTP';
+
+sub response
+{
+    my($self, $r, $code) = @_;
+    my $skip_mdtm = *$self->{'lwp_noMDTM'};
+    if ($r eq "2") {
+	if ($self->message =~ /^\d+\s+(\d+)$/) {
+	    *$self->{'lwp_res'}->content_length($1);
+	}
+    } elsif ($code eq "550") {
+	# Unluckily, we get the same answer for a file that does not
+	# exists and a file that happens to be a directory, so we must
+	# continue (but we can skip MDTM)
+	$skip_mdtm++
+    } else {
+	*$self->{'lwp_noSIZE'}++;
+    }
+
+    if ($skip_mdtm) {
+	$self->state("Ready");
+	$self->port();
+    } else {
+	my $file = *$self->{'lwp_file'};
+	$self->send_cmd("MDTM $file" => "Mdtm");
+    }
+}
+
+
+package LWP::Conn::FTP::Mdtm;
+use base 'LWP::Conn::FTP';
+use HTTP::Date qw(str2time);
+
+sub response
+{
+    my($self, $r, $code) = @_;
+    if ($r eq "2") {
+	if ($self->message =~ /^\d+\s+(\d{8})(\d{6})?$/) {
+	    my $t = str2time($2 ? "$1T$2" : $1);
+	    *$self->{'lwp_res'}->last_modified($t);
+	    # XXX  This is also the place to implement If-Modified-Since
+	}
+    } elsif ($code ne "550") {
+	*$self->{'lwp_noMDTM'}++;
+    }
+    $self->state("Ready");
+    $self->port();
+}
+
 
 package LWP::Conn::FTP::Dele;
 use base 'LWP::Conn::FTP';
@@ -487,7 +635,7 @@ use base 'LWP::Conn::FTP';
 sub response
 {
     my($self, $r, $code) = @_;
-    $self->state("Inlogged");
+    $self->state("Ready");
     my $mess = $self->message;
     $mess =~ s/^\d+\s+//;
     chomp($mess);
@@ -507,33 +655,145 @@ sub response
 {
     my($self, $r) = @_;
     if ($r eq "2") {
+	my $cmd = *$self->{'lwp_meth'} eq "PUT" ? "STOR" : "RETR";
 	my $file = *$self->{'lwp_file'};
-	$self->send_cmd("RETR $file" => "Retr");
+	$self->send_cmd("$cmd $file" => "Trans");
     } else {
 	$self->_error("PORT failed");
     }
 }
 
-package LWP::Conn::FTP::Retr;
-use base 'LWP::Conn::FTP::Inlogged';
+package LWP::Conn::FTP::Trans;
+use base 'LWP::Conn::FTP::Ready';
+
+sub activate
+{
+    # ignore
+}
+
+sub response
+{
+    my($self, $r, $code) = @_;
+    if ($r eq "1") {
+	# info message only, we know that the response will succeed
+	# and if method is "HEAD" we might want to send a ABRT at
+	# this time...
+	my $res = *$self->{'lwp_res'};
+	if ($self->message =~ /\((\d+)\s+bytes\)/) {
+	    # If it is already set, should we compare it with the
+	    # previous value??
+	    $res->content_length($1);
+	}
+	*$self->{'lwp_req'}->response_data("", $res);
+	# XXX catch except
+	$self->abort if *$self->{'lwp_meth'} eq "HEAD";
+    } elsif ($r eq "2") {
+	# we are done.  Must sync with closing of data connection
+	$self->data_done($code);
+    } elsif ($code eq "426") {  # transfer aborted
+	*$self->{'lwp_res'}->header("Abort" => $self->message);
+	$self->data_done($code);
+    } elsif ($code eq "550") {  # no such file
+	if (lc($self->message) =~ /or directory/) {
+	    delete(*$self->{'lwp_data'})->close;
+	    $self->state("Ready");
+	    $self->gen_response(404);
+	} else {
+	    # It might still be a directory, try to list it
+	    my $file = *$self->{'lwp_file'};
+	    $self->send_cmd("LIST $file" => "List");
+	    my $res = *$self->{'lwp_res'};
+	    $res->content_type("text/ftp-dir-listing");
+	    $res->remove_header("Content-Encoding");
+	}
+    } else {
+	$self->error("Trans");
+    }
+}
+
+sub data
+{
+    my $self = shift;
+    #return if *$self->{'lwp_meth'} eq "HEAD";
+
+    eval {
+	*$self->{'lwp_req'}->response_data($_[0], *$self->{'lwp_res'});
+    };
+    if ($@) {
+	# Initiate ABRT
+	$self->abort
+    }
+}
+
+sub data_really_done
+{
+    my $self = shift;
+    my $req = delete *$self->{'lwp_req'};
+    my $res = delete *$self->{'lwp_res'};
+    $req->response_done($res);
+
+    # Start with next request
+    $self->state("Ready");
+    $self->activate;
+}
+
+sub data_done
+{
+    my($self, $code) = @_;
+    if ($code && $code eq "426") {
+	$self->data_really_done;
+    } else {
+	$self->state("TransWait");
+    }
+}
+
+package LWP::Conn::FTP::TransWait;
+use base 'LWP::Conn::FTP::Trans';
+
+sub activate {}
+
+sub data_done
+{
+    my $self = shift;
+    $self->data_really_done;
+}
+
+sub response
+{
+    my $self = shift;
+    my($r, $code) = @_;
+    if ($code eq "225" || $code eq "226") {
+	# ABOR command successful ignored
+	$self->data_really_done;
+	return;
+    }
+    $self->SUPER::response(@_);
+}
+
+
+package LWP::Conn::FTP::List;
+use base 'LWP::Conn::FTP::Trans';
 
 sub response
 {
     my($self, $r, $code) = @_;
     if ($r eq "1") {
 	# info message, ignore
+	*$self->{'lwp_req'}->response_data("", *$self->{'lwp_res'});
+	# XXX catch except
     } elsif ($r eq "2") {
-	# we are done.  XXX: Must sync with data_done callback
-	$self->state("Inlogged");
+	# we are done.  Must sync with data_done callback
 	$self->data_done($self->message);
     } elsif ($code eq "550") {
-	$self->state("Inlogged");
 	delete(*$self->{'lwp_data'})->close;
-	$self->activate;
+	$self->state("Ready");
+	$self->gen_response(404);
     } else {
-	$self->_error("RETR");
+	$self->error("LIST");
     }
 }
+
+
 
 package LWP::Conn::FTP::Cwd;
 use base 'LWP::Conn::FTP';
@@ -549,7 +809,7 @@ sub cwd
 	    $self->send_cmd("CWD $dir");
 	}
     } else {
-	$self->state("Inlogged");
+	$self->state("Ready");
 	$self->cwd_done;
     }
 }
@@ -560,7 +820,7 @@ sub response
     if ($r eq "2") {
 	$self->cwd;
     } else {
-	$self->_error("Can't CWD");
+	$self->error("Can't CWD");
     }
 }
 
@@ -574,8 +834,15 @@ sub readable
 {
     my $self = shift;
     if (my $data = $self->accept) {
+	print "FTP DATA ACCEPT\n" if $LWP::Conn::FTP::DEBUG &&
+	                             $LWP::Conn::FTP::DEBUG > 2;
 	mainloop->readable($data);
 	bless $data, "LWP::Conn::FTP::Data";
+	if (my $w = *$self->{'lwp_write'}) {
+	    *$data->{'lwp_write'} = $w;
+	    *$data->{'lwp_wbuf'}  = '';
+	    mainloop->writable($data);
+	}
 	my $ftp = *$self->{'lwp_ftp'};
 	*$data->{'lwp_ftp'} = $ftp;
 	*$ftp->{'lwp_data'} = $data;
@@ -596,12 +863,17 @@ sub close
 package LWP::Conn::FTP::Data;
 use base 'LWP::Conn::FTP::Data::Listen';
 
+use LWP::MainLoop qw(mainloop);
+
 sub readable
 {
     my $self = shift;
     my $buf = "";
+    mainloop->activity(*$self->{'lwp_ftp'});
     my $n = sysread($self, $buf, 2048);
     if ($n) {
+	print "FTP DATA READ $n bytes\n" if $LWP::Conn::FTP::DEBUG &&
+	                                    $LWP::Conn::FTP::DEBUG > 2;
 	*$self->{'lwp_ftp'}->data($buf);
     } else {
 	if (defined $n) {
@@ -609,6 +881,45 @@ sub readable
 	} else {
 	    *$self->{'lwp_ftp'}->_error("Data connection error: $!");
 	}
+	$self->close;
+    }
+}
+
+sub writable
+{
+    my $self = shift;
+    #print "Writeable\n";
+    mainloop->activity(*$self->{'lwp_ftp'});
+    my $buf = \*$self->{'lwp_wbuf'};
+    unless (length $$buf) {
+	my $w = *$self->{'lwp_write'};
+	unless ($w) {
+	    *$self->{'lwp_ftp'}->data_done();
+	    $self->close;
+	    return;
+	}
+	$w = $$w if ref($$w);
+	if (ref($w) eq "CODE") {
+	    $$buf = &$w();
+	    unless (defined $buf and length $$buf) {
+		delete *$self->{'lwp_write'};
+		return;
+	    }
+	} else {
+	    $$buf = $$w;
+	    delete *$self->{'lwp_write'};
+	}
+	return unless length $$buf;
+    }
+    my $len = length($$buf);
+    $len = 2048 if $len > 2048;
+    my $n = syswrite($self, $$buf, $len);
+    if ($n) {
+	print "FTP DATA WRITE $n bytes\n" if $LWP::Conn::FTP::DEBUG &&
+	                                     $LWP::Conn::FTP::DEBUG > 2;
+	substr($$buf, 0, $n) = '';
+    } else {
+	*$self->{'lwp_ftp'}->_error("Data connection error: $!");
 	$self->close;
     }
 }

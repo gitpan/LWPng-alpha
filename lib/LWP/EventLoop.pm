@@ -1,6 +1,6 @@
 package LWP::EventLoop;
 
-# $Id: EventLoop.pm,v 1.14 1998/04/20 13:15:44 aas Exp $
+# $Id: EventLoop.pm,v 1.15 1998/04/29 09:40:44 aas Exp $
 
 # Copyright 1997-1998 Gisle Aas.
 #
@@ -104,6 +104,18 @@ sub timeout
 	$self->{fh}{int($fh)}[4] = undef;
     }
     $self->_fh($fh);
+}
+
+sub activity
+{
+    my $self = shift;
+    my $fh = shift;
+    if (my $timeout_spec = $self->{fh}{int($fh)}[4]) {
+	my $old = $timeout_spec->[2];
+	$timeout_spec->[2] = @_ ? (shift || $old) : time;
+	return $old;
+    }
+    return;
 }
 
 sub after
@@ -446,6 +458,17 @@ handle for some number of seconds.  Callbacks take the same form as
 for $e->readable.  The default callback is to invoke the $io->inactive
 method.  Pass 0 as the $secs argument to disable timeout for this
 handle.
+
+=item $e->activity($io, [$time]);
+
+Return time of last activity on the specified handle.  This is only
+valid if you have asked for a timeout() callback on the specified
+handle previously.
+
+The optional $time argument can be used to set this to some specified
+value.  If no $time argument is provided then the current time is
+recorded.  If the $time value is undef then the activity timestamp is
+not changed.
 
 =item $e->after($secs, $timer_callback)
 
