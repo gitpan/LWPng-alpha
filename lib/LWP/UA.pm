@@ -4,10 +4,11 @@ require LWP::Hooks;
 
 use strict;
 use vars qw($DEBUG $VERSION);
-$VERSION = sprintf("%d.%02d", q$Revision: 1.27 $ =~ /(\d+)\.(\d+)/);
+$VERSION = sprintf("%d.%02d", q$Revision: 1.28 $ =~ /(\d+)\.(\d+)/);
 
 use LWP::MainLoop qw(mainloop);
 
+require LWP::Version;
 require LWP::Server;
 require URI::Attr;
 
@@ -28,7 +29,7 @@ sub new
     my $class = shift;
     my $ua = $class->new_plain;
     $ua->setup_default_handlers;
-    $ua->agent("libwww-perl/ng-alpha ($^O)");
+    $ua->agent($LWP::Version::PRODUCT_TOKEN);
     $ua;
 }
 
