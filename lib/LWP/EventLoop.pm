@@ -1,8 +1,8 @@
 package LWP::EventLoop;
 
-# $Id: EventLoop.pm,v 1.9 1997/11/25 22:45:55 aas Exp $
+# $Id: EventLoop.pm,v 1.10 1998/03/17 11:06:37 aas Exp $
 
-# Copyright 1997 Gisle Aas.
+# Copyright 1997-1998 Gisle Aas.
 #
 # This library is free software; you can redistribute it and/or
 # modify it under the same terms as Perl itself.
@@ -262,7 +262,8 @@ sub one_event   # or none
 		    print STDERR "\n";
 		}
 	    }
-	    &$cb();
+	    eval { &$cb(); };
+	    warn $@ if $@ && $^W;
 	    return;
 	}
     }
