@@ -1,6 +1,6 @@
 package LWP::Version;
 
-$VERSION       = '0.23';  # $Date: 1998/07/07 21:52:14 $
+$VERSION       = '0.24';  # $Date: 1999/04/12 13:04:57 $
 $PRODUCT_TOKEN = "libwww-perl/ng-alpha-$VERSION ($^O)";
 
 1;

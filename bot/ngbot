@@ -7,7 +7,7 @@ use lib "../lib";
 use strict;
 
 use vars qw($VERSION);
-$VERSION = sprintf("%d.%02d", q$Revision: 1.1 $ =~ /(\d+)\.(\d+)/);
+$VERSION = sprintf("%d.%02d", q$Revision: 1.3 $ =~ /(\d+)\.(\d+)/);
 
 use LWP::UA;
 my $ua = LWP::UA->new;
@@ -25,8 +25,8 @@ use LWP::Request ();
 use LWP::MainLoop qw(run one_event empty);
 
 use HTML::LinkExtor ();
-use URI::URL qw(url);
-use MD5 ();
+use URI;
+use Digest::MD5 ();
 
 require 'db.pl';
 use vars qw($dbh);
@@ -45,7 +45,7 @@ my $sth;
 $sth = $dbh->query($sql) or die $dbh->errmess;
 
 while (my($id, $scheme,$host,$port,$abs_path) = $sth->fetchrow) {
-    my $url = URI::URL->new("$scheme:$abs_path");
+    my $url = URI->new("$scheme:$abs_path");
     $url->host($host) if $host;
     $url->port($port) if $port;
     my $method = visit_ok($url);
@@ -107,7 +107,7 @@ sub parse_data
 	} else {
 	    # ignore
 	}
-	$req->{md5} = MD5->new;
+	$req->{md5} = Digest::MD5->new;
     }
     if (my $p = $req->{'linkextor'}) {
 	$p->parse($chunk);

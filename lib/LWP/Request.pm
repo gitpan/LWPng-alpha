@@ -3,12 +3,14 @@ package LWP::Request;
 use strict;
 use vars qw(@ISA);
 
+require LWP::UA;  # should always be loaded
+
 require LWP::Version;
 require HTTP::Request;
 require LWP::Hooks;
 @ISA=qw(HTTP::Request LWP::Hooks);
 
-require URI::URL;
+require URI;
 
 sub new2  # alternative ctor that sets up some handlers
 {

@@ -1,10 +1,10 @@
-package URI::Attr; # $Id: Attr.pm,v 1.6 1998/04/23 09:49:27 aas Exp $
+package URI::Attr; # $Id: Attr.pm,v 1.7 1999/04/12 13:17:25 gisle Exp $
 
-use URI::URL ();
 use strict;
+use URI;
 
 use vars qw($VERSION);
-$VERSION = sprintf("%d.%02d", q$Revision: 1.6 $ =~ /(\d+)\.(\d+)/);
+$VERSION = sprintf("%d.%02d", q$Revision: 1.7 $ =~ /(\d+)\.(\d+)/);
 
 
 # The URI::Attr is a tree.  The nodes are arrays with 2 hash elements.
@@ -25,10 +25,10 @@ sub new
 }
 
 
-sub _attr  # this method should probably be implemented by URI::URL itself
+sub _attr  # this method should probably be implemented by URI itself
 {
     my($self, $url) = @_;
-    $url = URI::URL->new($url) unless ref($url);
+    $url = URI->new($url) unless ref($url);
 
     my @attr;
     my $scheme = $url->scheme;
@@ -53,9 +53,11 @@ sub _attr  # this method should probably be implemented by URI::URL itself
 		push(@attr, [DOMAIN => $1]) while $h =~ s/(\.[^.]+)$//;
 	    }
 	    push(@attr, [HOST => $h]);
-	    push(@attr, [SERVER => $url->port]);
+	    if (UNIVERSAL::isa($url, 'URI::_server')) {
+		push(@attr, [SERVER => $url->port]);
+	    }
 	}
-	my $p = $url->epath;
+	my $p = $url->path;
 	$p =~ s,^/,,;
 	if (length $p) {
 	    push(@attr, [DIR => $1]) while $p =~ s,^([^/]*/),,;
@@ -276,7 +278,7 @@ have been a better way?
 
 =head1 SEE ALSO
 
-L<URI::URL>
+L<URI>
 
 =head1 COPYRIGHT
 
