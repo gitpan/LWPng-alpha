@@ -4,7 +4,8 @@ use strict;
 use vars qw(@ISA);
 
 require HTTP::Request;
-@ISA=qw(HTTP::Request);
+require LWP::Hooks;
+@ISA=qw(HTTP::Request LWP::Hooks);
 
 require URI::URL;
 
@@ -17,6 +18,7 @@ require URI::URL;
 #
 # Added stuff are:
 #
+#    hooks
 #    priority
 #    proxy
 #    data_cb
@@ -24,104 +26,55 @@ require URI::URL;
 #    mgr
 #   (previous)
 #
-# Added flags are:
-#
-#    want_progress_report
-#    auto_redirect
-#    auto_auth
-#
+
+sub new
+{
+    my $class = shift;
+    my $self = $class->SUPER::new(@_);
+    $self->add_hook("response_handler", \&auto_redirect);
+    $self->add_hook("response_handler", \&auto_auth);
+    $self;
+}
 
 
 sub clone
 {
     my $self = shift;
     my $clone = $self->SUPER::clone;
-    for (qw(priority proxy mgr data_cb done_cb
-            want_progress_report auto_redirect auto_auth)) {
+    for (qw(priority proxy mgr data_cb done_cb)) {
 	next unless exists $self->{$_};
 	$clone->{$_} = $self->{$_};
     }
     $clone;
 }
 
+
 sub response_data
 {
     my $self = shift;
     # don't want to copy data in $_[0] unnecessary
     my $res = $_[1];
+    $self->run_hooks("response_data", $_[0], $res);
     if ($self->{data_cb} && $res->is_success) {
 	$self->{data_cb}->($_[0], $res, $self);
     } else {
 	$res->add_content($_[0]);
     }
-
-    if ($self->{want_progress_report}) {
-	$self->{received_bytes} += length($_[0]);
-	my $percentage;
-	if (my $cl = $res->header('Content-Length')) {
-	    $percentage = sprintf "%.0f%%", 100 * $self->{received_bytes} / $cl;
-	}
-	# XXX also calculate average throughput...
-	$self->progress($percentage, $self->{received_bytes});
-    }
 }
 
-sub progress
-{
-    my($self, $percentage, $bytes) = @_;
-    if ($percentage) {
-	print "$percentage\n";
-    } else {
-	print "$bytes bytes received\n";
-    }
-}
 
 sub response_done
 {
     my($self, $res) = @_;
 
-    if (my $prev = $self->previous) {
+    if (my $prev = $self->{'previous'}) {
 	$res->previous($prev);
-	$self->previous(undef);  # not stricly necessary
+	delete $self->{'previous'};  # not strictly necessary
     }
-    $res->request($self);
+    $res->request($self);#or should we depend on the connection to set this up?
 
-    if ($self->{auto_redirect} && $res->is_redirect) {
-        my $referral = $self->clone;
-
-        # And then we update the URL based on the Location:-header.
-        # Some servers erroneously return a relative URL for redirects,
-        # so make it absolute if it not already is.
-        my $referral_uri = (URI::URL->new($res->header('Location'),
-                                          $res->base))->abs;
-        $referral->url($referral_uri);
-
-        # Check for loop in the redirects
-      LOOP_CHECK: {
-	    my $r = $res;
-	    while ($r) {
-		if ($r->request->url->as_string eq $referral_uri->as_string) {
-		    $res->header("Client-Warning" =>
-				 "Redirect loop detected");
-		    last LOOP_CHECK;
-		}
-		$r = $r->previous;
-	    }
-
-	    # Respool new request with fairly high priority
-	    $referral->previous($res);
-	    $referral->priority(10) if $referral->priority > 10;
-	    $self->{'mgr'}->spool($referral);
-	    return;
-	}
-	
-    } elsif (0 && $self->{auto_auth} &&
-	     ($res->code == &HTTP::Status::RC_UNAUTHORIZED ||
-	      $res->code == &HTTP::Status::RC_PROXY_AUTHENTICATION_REQUIRED))
-    {
-	#XXX NYI
-
-    }
+    $self->run_hooks("response_done", $res);
+    return if $self->run_hooks_until_success("response_handler", $res);
 
     if ($self->{done_cb}) {
 	$self->{done_cb}->($res, $self);
@@ -129,6 +82,7 @@ sub response_done
 	$self->{'mgr'}->response_received($res);
     }
 }
+
 
 sub gen_response
 {
@@ -156,17 +110,123 @@ sub gen_response
     $self->response_done($res);
 }
 
-# Accessor functions for some simple attributes
-
-sub previous
+sub auto_redirect
 {
-    my $self = shift;
-    my $old = $self->{'previous'};
-    if (@_) {
-	$self->{'previous'} = shift;
+    my($self, $res) = @_;
+    my $code = $res->code;
+    return unless $code =~ /^30[12357]$/;
+    my $new = $self->clone;
+    my $method = $new->method;
+    if ($code == 303 && $method ne "HEAD") {
+	$method = "GET";
+	$new->method($method);
     }
-    $old;
+    return if $method ne "GET" &&
+	      $method ne "HEAD" &&
+	      !$self->redirect_ok($res);
+    my $loc = $res->header('Location');
+    $loc = (URI::URL->new($loc, $res->base))->abs(undef,1);
+
+    if ($code == 305) {  # RC_USE_PROXY
+	$new->proxy($loc);
+	my $ustr = $new->url->as_string;
+	my $pstr = $loc->as_string;
+	# check for loops
+	for (my $r = $res; $r; $r = $r->previous) {
+	    my $req = $r->request;
+	    my $pxy = $req->proxy || "";
+	    if ($req->url->as_string eq $ustr && $pxy eq $pstr) {
+		$res->push_header("Client-Warning" =>
+				  "Proxy redirect loop detected");
+		return;
+	    }
+	}
+    } else {
+	$new->url($loc);
+	my $ustr = $loc->as_string;
+	# check for loops
+	for (my $r = $res; $r; $r = $r->previous) {
+	    if ($r->request->url->as_string eq $ustr) {
+		$res->push_header("Client-Warning" =>
+				  "Redirect loop detected");
+		return;
+	    }
+	}
+    }
+
+    # New request is OK, spool it at somewhat high priority.
+    $new->{'previous'} = $res;
+    $new->priority(10) if $new->priority > 10;
+    $self->{'mgr'}->spool($new);
+    1;  # consider this request handled
 }
+
+sub redirect_ok
+{
+    0;
+}
+
+sub auto_auth
+{
+    my($self, $res) = @_;
+    my $code = $res->code;
+    return unless $code =~ /^40[17]$/;
+    my $proxy = ($code == 407);
+
+    my $ch_header = $proxy ?  "Proxy-Authenticate" : "WWW-Authenticate";
+    my @challenge = $res->header($ch_header);
+    unless (@challenge) {
+	$res->header("Client-Warning" => 
+		     "Missing $ch_header header");
+	return;
+    }
+
+    require HTTP::Headers::Util;
+    for my $challenge (@challenge) {
+	$challenge =~ tr/,/;/;  # "," is used to separate auth-params!!
+	($challenge) = HTTP::Headers::Util::split_header_words($challenge);
+	my $orig_scheme = shift(@$challenge);
+	shift(@$challenge); # no value
+	my $scheme = uc($orig_scheme);
+	$challenge = { @$challenge };  # make rest into a hash
+
+	unless ($scheme =~ /^([A-Z]+(?:-[A-Z]+)*)$/) {
+	    $res->header("Client-Warning" => 
+			 "Bad authentication scheme name '$orig_scheme'");
+	    next;
+	}
+	$scheme = $1;  # untainted now
+	my $class = "LWP::Authen::$scheme";
+	$class =~ s/-/_/g;
+	
+	no strict 'refs';
+	unless (defined %{"$class\::"}) {
+	    # try to load it
+	    eval "require $class";
+	    if ($@) {
+		if ($@ =~ /^Can\'t locate/) {
+		    $res->push_header("Client-Warning" =>
+			   "Unsupport authentication scheme '$orig_scheme'");
+		} else {
+		    $res->push_header("Client-Warning" => $@);
+		}
+		next;
+	    }
+	}
+	my $done = $class->authenticate($self, $res, $proxy, $challenge);
+	return $done if $done;
+    }
+    $res->push_header("Client-Warning" => "Kilroy was here");
+    0;
+}
+
+sub get_upw
+{
+    ("gisle", "hemmelig");
+}
+
+
+# Accessor functions for some simple attributes
 
 sub managed_by
 {

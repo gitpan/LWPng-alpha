@@ -1,6 +1,6 @@
 package LWP::Conn::HTTP; # An HTTP Connection class
 
-# $Id: HTTP.pm,v 1.14 1998/03/19 18:59:55 aas Exp $
+# $Id: HTTP.pm,v 1.15 1998/03/23 12:45:23 aas Exp $
 
 # Copyright 1997-1998 Gisle Aas.
 #
@@ -34,7 +34,7 @@ sub new
     my $mgr = delete $cnf{ManagedBy} ||
       Carp::croak("'ManagedBy' is mandatory");
     my $host =   delete $cnf{Host} || delete $cnf{PeerAddr} ||
-      Carp::croak("'Host' is mandatory");
+      Carp::croak("'Host' is mandatory for HTTP");
     my $port;
     $port = $1 if $host =~ s/:(\d+)//;
     $port = delete $cnf{Port} || delete $cnf{PeerPort} || $port || 80;
