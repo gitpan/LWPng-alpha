@@ -31,7 +31,7 @@ If file name ends with "/" assume that it is a directory and skip RETR
 
 package LWP::Conn::FTP;
 
-# $Id: FTP.pm,v 1.13 1998/04/29 13:39:39 aas Exp $
+# $Id: FTP.pm,v 1.14 1998/06/27 09:21:09 aas Exp $
 
 # Copyright 1997-1998 Gisle Aas.
 #
@@ -891,7 +891,7 @@ sub writable
     #print "Writeable\n";
     mainloop->activity(*$self->{'lwp_ftp'});
     my $buf = \*$self->{'lwp_wbuf'};
-    unless (length $$buf) {
+    unless (defined $$buf and length $$buf) {
 	my $w = *$self->{'lwp_write'};
 	unless ($w) {
 	    *$self->{'lwp_ftp'}->data_done();
@@ -901,7 +901,7 @@ sub writable
 	$w = $$w if ref($$w);
 	if (ref($w) eq "CODE") {
 	    $$buf = &$w();
-	    unless (defined $buf and length $$buf) {
+	    unless (defined $$buf and length $$buf) {
 		delete *$self->{'lwp_write'};
 		return;
 	    }

@@ -1,19 +1,25 @@
 package LWP::Conn::HTTP; # An HTTP Connection class
 
-# $Id: HTTP.pm,v 1.31 1998/04/07 12:57:58 aas Exp $
+# $Id: HTTP.pm,v 1.32 1998/06/27 09:21:09 aas Exp $
 
 # Copyright 1997-1998 Gisle Aas.
 #
 # This library is free software; you can redistribute it and/or
 # modify it under the same terms as Perl itself.
 
-# A hack that should work at least on Linux
+# A hack that should work at least on systems with POSIX.pm.  It
+# implements the constant EINPROGRESS and IO::Handle->blocking;
 # XXX: When we require IO-1.18, then this hack can be removed.
 require IO::Handle;
 unless (defined &IO::EINPROGRESS) {
-    $! = 115;
-    die "No EINPROGRESS found ($!)" unless $! eq "Operation now in progress";
-    *IO::EINPROGRESS = sub () { 115; };
+    my $einprogress = -1;
+    eval {
+	require POSIX;
+	$einprogress = &POSIX::EINPROGRESS;
+    };
+    $! = $einprogress;
+    die "No EINPROGRESS found ($!)" if ($@ or $! ne "Operation now in progress");
+    *IO::EINPROGRESS = sub () { $einprogress; };
 
     # we also emulate $handle->blocking call provided by newer versions of
     # the IO modules
