@@ -1,6 +1,6 @@
 package LWP::Conn::HTTP; # An HTTP Connection class
 
-# $Id: HTTP.pm,v 1.10 1998/03/18 10:50:45 aas Exp $
+# $Id: HTTP.pm,v 1.14 1998/03/19 18:59:55 aas Exp $
 
 # Copyright 1997-1998 Gisle Aas.
 #
@@ -58,6 +58,8 @@ sub new
 	$addrtype = AF_INET;
 	$addrs[0] = inet_aton($host);
     } else {
+	# XXX might want a state for handling non-blocking
+	# gethostbyname, perhaps by using the Net::DNS module.
 	(undef, undef, $addrtype, undef, @addrs) = gethostbyname($host);
 	die "Bad address type '$addrtype'" if @addrs && $addrtype != AF_INET;
     }
@@ -94,8 +96,12 @@ sub new
 	    my($port, $addr) = unpack_sockaddr_in($addr);
 	    print STDERR "Connecting ", inet_ntoa($addr), ":$port...\n";
 	}
-	unless (connect($sock, $addr)) {
+	if (connect($sock, $addr)) {
+	    last;
+	} else {
 	    if ($! == &IO::EINPROGRESS) {
+		# XXX Perhaps we need some way of checking the other
+		# addresses in @addrs if this one fail.
 		$sock->state("Connecting");
 		mainloop->writable($sock);
 		return $sock;
@@ -120,7 +126,7 @@ sub state
 {
     my $self = shift;
     my $old = ref($self);
-    $old =~ s/^LWP::Conn::HTTP:*//;
+    $old =~ s/^LWP::Conn::HTTP:://;
     if (@_) {
 	print STDERR "State trans: $old --> $_[0]\n" if $DEBUG;
 	bless $self, "LWP::Conn::HTTP::$_[0]";
@@ -141,15 +147,23 @@ sub new_request
     if ($req) {
 	print STDERR "$self: New-Request $req\n" if $DEBUG;
 	my @rlines;
+	my $method = $req->method || "GET";
 	my $uri = $req->proxy ? $req->url->as_string : $req->url->full_path;
-	push(@rlines, $req->method . " $uri HTTP/1.1");
+	my $proto = $req->protocol || "HTTP/1.1";
+	push(@rlines, "$method $uri $proto");
 	$req->header("Host" => $req->url->netloc);
-	#$req->header("Connection" => "close");
+	*$self->{'lwp_req_count'}++;
+	if ($proto eq "HTTP/1.0") {
+	    # can't send any more request, server will close connection
+	    *$self->{'lwp_req_limit'} = 1;
+	} elsif (*$self->{'lwp_req_count'} == *$self->{'lwp_req_limit'}) {
+	    # make server close the connection
+	    $req->header("Connection" => "close");
+	}
 	$req->scan(sub { push(@rlines, "$_[0]: $_[1]") });
 	push(@rlines, "", $req->content);
 	push(@{ *$self->{'lwp_req'} }, $req);
 	*$self->{'lwp_wbuf'} = join("\015\012", @rlines);
-	*$self->{'lwp_req_count'}++;  # XXX: should mark last request somehow
 	mainloop->writable($self);
 	return $req;
     }
@@ -215,13 +229,28 @@ sub _error
 	    $res->header("Client-Orig-Status" => $res->status_line);
 	    $res->code(591); # XXX
 	    $res->message($msg);
-	    $cur_req->done($res);
+	    $cur_req->response_done($res);
 	} else {
 	    $cur_req->gen_response(590, "No response");
 	}
     }
     $self->state("Closed");
     $mgr->connection_closed($self);
+}
+
+sub response_data
+{
+    my $self = shift;
+    my $req  = shift;
+    eval {
+	$req->response_data(@_);
+    };
+    if ($@) {
+	chomp($@);
+	$self->_error($@);
+	return;
+    }
+    return 1;
 }
 
 
@@ -405,6 +434,7 @@ sub check_rbuf
     *$self->{'lwp_res'} = $res;
     my $req = $self->current_request;
     $res->request($req);
+    return unless $self->response_data($req, "", $res);
     #print $res->as_string if $LWP::Conn::HTTP::DEBUG;
 
     # Determine how to find the end of message
@@ -469,7 +499,7 @@ sub end_of_response
     my $self = shift;
     print STDERR "$self: End-Of-Response\n" if $LWP::Conn::HTTP::DEBUG;
     my $req = shift @{*$self->{'lwp_req'}};  # get rid of current request
-    $req->done(*$self->{'lwp_res'});
+    $req->response_done(*$self->{'lwp_res'});
     *$self->{'lwp_res'} = undef;
     if ($self->last_request_sent && !$self->current_request) {
 	mainloop->forget($self);
@@ -505,7 +535,7 @@ sub check_rbuf
     my $data = substr($$buf, 0, $cont_len);
     substr($$buf, 0, $cont_len) = '';
     $cont_len -= length($data);
-    $res->request->response_data($data, $res);
+    return unless $self->response_data($res->request, $data, $res);
     if ($cont_len > 0) {
 	*$self->{'lwp_cont_len'} = $cont_len;
     } else {
@@ -539,7 +569,7 @@ sub check_rbuf
 		substr($data, -2+$chunked, 2-$chunked) = '';
 		$chunked = -1 if $chunked == 0;
 	    }
-	    $res->request->response_data($data, $res);
+	    return unless $self->response_data($res->request, $data, $res);
 
 	} elsif ($chunked == -1) {
 	    # read a new chunk header
@@ -636,9 +666,9 @@ sub check_rbuf
 	    }
 	    my $data = substr($$buf, 0, $buflen - length($boundary));
 	    substr($$buf, 0, length($data)) = '';
-	    $res->request->response_data($data, $res) if length($data);
+	    $self->response_data($res->request, $data, $res) if length($data);
 	} else {
-	    $res->request->response_data($$buf, $res);
+	    $self->response_data($res->request, $$buf, $res);
 	    $$buf = '';
 	}
 	return;
@@ -646,7 +676,7 @@ sub check_rbuf
     # boundary is found in data
     my $data = substr($$buf, 0, $i + length($boundary));
     substr($$buf, 0, length($data)) = '';
-    $res->request->response_data($data, $res);
+    return unless $self->response_data($res->request, $data, $res);
     $self->end_of_response;
 }
 
@@ -662,7 +692,7 @@ sub check_rbuf
     my $self = shift;
     my $buf      = \ *$self->{'lwp_rbuf'};
     my $res      =   *$self->{'lwp_res'};
-    $res->request->response_data($$buf, $res);
+    $self->response_data($res->request, $$buf, $res);
     $$buf = '';
 }
 
