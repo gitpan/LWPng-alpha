@@ -1,6 +1,6 @@
 package LWP::Conn::_Connect;
 
-# $Id: _Connect.pm,v 1.5 1998/07/05 14:34:38 aas Exp $
+# $Id: _Connect.pm,v 1.6 1998/07/07 21:36:55 aas Exp $
 
 # Copyright 1997-1998 Gisle Aas.
 #
@@ -199,6 +199,22 @@ sub try_next_address
     $self->close;
     bless $self, delete *$self->{'lwp_connected_class'};
     $self->connect_failed($msg, delete *$self->{'lwp_opaque'});
+}
+
+# These two methods might be called by the manager
+sub activate
+{  # ignore
+}
+
+sub stop
+{
+    my $self = shift;
+    delete *$self->{'lwp_other_addrs'};
+    delete *$self->{'lwp_timeout'};
+    mainloop->forget($self);
+    $self->close;
+    bless $self, delete *$self->{'lwp_connected_class'};
+    $self->connect_failed("Stopped", delete *$self->{'lwp_opaque'});
 }
 
 1;
